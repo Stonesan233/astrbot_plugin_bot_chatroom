@@ -1,0 +1,5 @@
+name: astrbot_plugin_bot_chatroom
+desc: 双人格聊天室协作（露娜大人 × 朝日娘），依赖 cc-astrbot-agent
+version: v0.1.0
+author: Stonesan
+repo: https://github.com/Stonesan233/astrbot_plugin_bot_chatroom

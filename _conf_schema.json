@@ -1,0 +1,71 @@
+{
+  "claude_api_key": {
+    "type": "string",
+    "description": "Claude API 密钥",
+    "hint": "Anthropic API Key，与 cc-astrbot-agent 共享同一密钥。必填。",
+    "default": ""
+  },
+  "base_url": {
+    "type": "string",
+    "description": "Claude API 端点 URL",
+    "hint": "自定义 API 端点，留空使用 https://api.anthropic.com",
+    "default": ""
+  },
+  "model": {
+    "type": "string",
+    "description": "内部协作使用的模型",
+    "hint": "两位人格进行内部对话时调用的模型名称",
+    "default": "claude-3-7-sonnet-20250219"
+  },
+  "project_root": {
+    "type": "string",
+    "description": "项目根目录",
+    "hint": "Agent 操作的工作目录，留空则使用插件所在目录",
+    "default": ""
+  },
+  "enable_chatroom": {
+    "type": "bool",
+    "description": "是否启用聊天室功能",
+    "hint": "关闭后 /chatroom 命令将不响应任何消息",
+    "default": true
+  },
+  "max_internal_turns": {
+    "type": "int",
+    "description": "最大内部委托轮次",
+    "hint": "两位人格之间最多进行的内部对话轮数，防止死循环",
+    "default": 8,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
+  },
+  "auto_review": {
+    "type": "bool",
+    "description": "是否启用自动审阅",
+    "hint": "开启后，内部协作的最终结果会经发起人格再次审阅整理后再呈现给主人",
+    "default": false
+  },
+  "response_max_length": {
+    "type": "int",
+    "description": "单轮回复最大字符数",
+    "hint": "超过此长度的回复会被截断，避免消息过长",
+    "default": 3000,
+    "slider": {
+      "min": 500,
+      "max": 8000,
+      "step": 500
+    }
+  },
+  "history_preview_length": {
+    "type": "int",
+    "description": "内部对话历史预览长度",
+    "hint": "传递给下一轮的历史记录中，每条回复的截断字符数",
+    "default": 500,
+    "slider": {
+      "min": 100,
+      "max": 2000,
+      "step": 100
+    }
+  }
+}
