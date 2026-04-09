@@ -126,8 +126,8 @@ class BotChatroomPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._agent: Optional[ClaudeCodeAgent] = None
-        # 对话状态: key = conversation_id
-        self.conversations: dict[str, dict] = {}
+        # 内置聊天室会话状态: key = conversation_id
+        self.chatroom_sessions: dict[str, dict] = {}
 
     # ===================================================================
     # 生命周期
@@ -176,7 +176,7 @@ class BotChatroomPlugin(Star):
     async def terminate(self):
         """插件销毁：清理资源"""
         self._agent = None
-        self.conversations.clear()
+        self.chatroom_sessions.clear()
         logger.info(f"[{PLUGIN_NAME}] 已卸载")
 
     # ===================================================================
@@ -332,10 +332,10 @@ class BotChatroomPlugin(Star):
         return None
 
     # ===================================================================
-    # 核心：_internal_delegate — 内部委托循环
+    # 核心：_internal_chatroom — 内置小聊天室
     # ===================================================================
 
-    async def _internal_delegate(
+    async def _internal_chatroom(
         self,
         from_persona: str,
         to_persona: str,
@@ -343,10 +343,11 @@ class BotChatroomPlugin(Star):
         event: AstrMessageEvent,
     ) -> str:
         """
-        内部委托：from_persona 将 message 委托给 to_persona。
+        内置小聊天室：解析消息中的 @指令，调用对应 persona 的 agent.run_task()，
+        把每轮结果分段实时通过 event.send() 发送。
 
         流程:
-          1. 获取 / 创建对话状态 (self.conversations[conversation_id])
+          1. 获取 / 创建会话状态 (self.chatroom_sessions[conversation_id])
           2. 每轮: 构建 persona prompt → 调用 agent.run_task() → 记录
           3. 检测回复中 @委托 → 切换目标人格继续
           4. 无委托或达到 max_rounds → 结束
@@ -377,7 +378,7 @@ class BotChatroomPlugin(Star):
         current_task = message
 
         logger.info(
-            f"[{PLUGIN_NAME}] _internal_delegate 开始 | "
+            f"[{PLUGIN_NAME}] _internal_chatroom 开始 | "
             f"{PERSONAS.get(delegator, {}).get('label', delegator)} → "
             f"{PERSONAS[current_persona]['label']} | "
             f"任务={current_task[:80]}"
@@ -486,7 +487,7 @@ class BotChatroomPlugin(Star):
         except Exception as e:
             conv["status"] = "error"
             tb = traceback.format_exc()
-            logger.error(f"[{PLUGIN_NAME}] _internal_delegate 异常:\n{tb}")
+            logger.error(f"[{PLUGIN_NAME}] _internal_chatroom 异常:\n{tb}")
             return f"内部协作异常: {e}"
 
         elapsed = time.monotonic() - start
@@ -514,7 +515,7 @@ class BotChatroomPlugin(Star):
             )
 
         logger.info(
-            f"[{PLUGIN_NAME}] _internal_delegate 结束 | "
+            f"[{PLUGIN_NAME}] _internal_chatroom 结束 | "
             f"状态={conv['status']} | "
             f"轮次={len(conv['turns'])} | "
             f"耗时={elapsed:.1f}s"
@@ -698,7 +699,7 @@ class BotChatroomPlugin(Star):
     ) -> str:
         """
         解析消息中的 @mention，确定目标人格，
-        然后调用 _internal_delegate 启动内部协作循环。
+        然后调用 _internal_chatroom 启动内置聊天室循环。
         """
         target_persona = await self._detect_target_persona(text, event)
         task = self._clean_task_text(text)
@@ -715,7 +716,7 @@ class BotChatroomPlugin(Star):
             f"任务={task[:80]}"
         )
 
-        return await self._internal_delegate(
+        return await self._internal_chatroom(
             from_persona="system",
             to_persona=target_persona,
             message=task,
@@ -742,8 +743,8 @@ class BotChatroomPlugin(Star):
 
     def _get_or_create_conversation(self, conversation_id: str) -> dict:
         """获取或创建对话状态"""
-        if conversation_id not in self.conversations:
-            self.conversations[conversation_id] = {
+        if conversation_id not in self.chatroom_sessions:
+            self.chatroom_sessions[conversation_id] = {
                 "id": conversation_id,
                 "turns": [],
                 "initial_persona": None,
@@ -752,7 +753,7 @@ class BotChatroomPlugin(Star):
                 "created_at": time.time(),
                 "updated_at": time.time(),
             }
-        return self.conversations[conversation_id]
+        return self.chatroom_sessions[conversation_id]
 
     def _split_response(self, text: str, chunk_size: int = 400) -> list[str]:
         """
@@ -793,12 +794,12 @@ class BotChatroomPlugin(Star):
         now = time.time()
         stale = [
             cid
-            for cid, conv in self.conversations.items()
+            for cid, conv in self.chatroom_sessions.items()
             if conv["status"] != "active"
             and (now - conv["updated_at"]) > _CONVERSATION_TTL
         ]
         for cid in stale:
-            del self.conversations[cid]
+            del self.chatroom_sessions[cid]
         if stale:
             logger.debug(
                 f"[{PLUGIN_NAME}] 清理 {len(stale)} 个过期会话"
@@ -881,15 +882,15 @@ class BotChatroomPlugin(Star):
     def _handle_reset(self, event: AstrMessageEvent) -> str:
         """重置当前会话"""
         cid = self._get_conversation_id(event)
-        if cid in self.conversations:
-            del self.conversations[cid]
+        if cid in self.chatroom_sessions:
+            del self.chatroom_sessions[cid]
             return "聊天室会话已重置，可以开始新的协作。"
         return "当前无活跃会话，无需重置。"
 
     def _handle_history(self, event: AstrMessageEvent) -> str:
         """查看当前会话的对话历史"""
         cid = self._get_conversation_id(event)
-        conv = self.conversations.get(cid)
+        conv = self.chatroom_sessions.get(cid)
 
         if not conv or not conv["turns"]:
             return (
@@ -942,7 +943,7 @@ class BotChatroomPlugin(Star):
     def _status_text(self, event: AstrMessageEvent) -> str:
         """协作状态报告：全局 + 当前会话"""
         cid = self._get_conversation_id(event)
-        conv = self.conversations.get(cid)
+        conv = self.chatroom_sessions.get(cid)
 
         agent_ok = self._agent is not None
         api_ok = self._agent is not None and bool(self._agent.api_key)
@@ -950,12 +951,12 @@ class BotChatroomPlugin(Star):
 
         # 统计全部会话
         active_count = sum(
-            1 for c in self.conversations.values()
+            1 for c in self.chatroom_sessions.values()
             if c["status"] == "active"
         )
-        total_count = len(self.conversations)
+        total_count = len(self.chatroom_sessions)
         total_turns = sum(
-            len(c["turns"]) for c in self.conversations.values()
+            len(c["turns"]) for c in self.chatroom_sessions.values()
         )
 
         lines: list[str] = [
@@ -973,7 +974,7 @@ class BotChatroomPlugin(Star):
 
         # ---- 全局活跃会话列表 ----
         active_convs = [
-            (c_id, c) for c_id, c in self.conversations.items()
+            (c_id, c) for c_id, c in self.chatroom_sessions.items()
             if c["status"] == "active"
         ]
         if active_convs:
