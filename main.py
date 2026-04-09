@@ -269,7 +269,15 @@ class BotChatroomPlugin(Star):
         return "luna"
 
     def _detect_persona_from_text(self, text: str) -> Optional[str]:
-        """从文本 @mention 中检测目标人格（大小写不敏感）"""
+        """从文本 @mention 中检测目标人格（大小写不敏感），兼容群聊 @bot 前缀"""
+        # 群聊消息可能以 @botname 开头，先清理掉
+        cleaned = re.sub(r"^@\S+\s*", "", text.strip())
+        cleaned_lower = cleaned.lower()
+        for pid, pinfo in PERSONAS.items():
+            for name in pinfo["names"]:
+                if name.lower() in cleaned_lower:
+                    return pid
+        # 也检查原始文本
         text_lower = text.lower()
         for pid, pinfo in PERSONAS.items():
             for name in pinfo["names"]:
@@ -408,16 +416,21 @@ class BotChatroomPlugin(Star):
                 # 2) 调用底层 agent.run_task(task=prompt, persona=to_persona)
                 response = await self._call_agent(prompt, current_persona)
 
-                # 3) 每轮结果实时发给主人
+                # 3) 每轮结果分段实时发给主人（300-500 字一段）
                 try:
                     emoji = PERSONAS[current_persona]["emoji"]
                     label = PERSONAS[current_persona]["label"]
-                    preview = response[:300]
-                    if len(response) > 300:
-                        preview += "..."
-                    await event.send(
-                        f"{emoji} [{label}] 第{round_num}轮回复:\n{preview}"
+                    segments = self._split_response(
+                        response,
+                        self.config.get("response_segment_size", 400),
                     )
+                    for si, seg in enumerate(segments):
+                        prefix = (
+                            f"{emoji} [{label}] 第{round_num}轮"
+                            if si == 0
+                            else f"  (续{si})"
+                        )
+                        await event.send(f"{prefix}:\n{seg}")
                 except Exception:
                     pass
 
@@ -711,8 +724,17 @@ class BotChatroomPlugin(Star):
     # ===================================================================
 
     def _get_conversation_id(self, event: AstrMessageEvent) -> str:
-        """基于 unified_msg_origin 生成 conversation_id"""
-        umo = getattr(event, "unified_msg_origin", None)
+        """
+        生成 conversation_id。
+
+        群聊: unified_msg_origin + sender_id （群内按用户隔离）
+        私聊: unified_msg_origin
+        """
+        umo = getattr(event, "unified_msg_origin", None) or ""
+        sender = getattr(event, "sender_id", None) or ""
+        # 如果 umo 中已包含 group 标识，说明是群聊，追加 sender 隔离
+        if sender and "group" in umo.lower():
+            return f"{umo}::{sender}"
         return str(umo) if umo else str(uuid.uuid4())
 
     def _get_or_create_conversation(self, conversation_id: str) -> dict:
@@ -728,6 +750,33 @@ class BotChatroomPlugin(Star):
                 "updated_at": time.time(),
             }
         return self.conversations[conversation_id]
+
+    def _split_response(self, text: str, chunk_size: int = 400) -> list[str]:
+        """
+        将长文本按段落/换行拆分为 300-500 字的分段。
+        优先在换行符处切割，避免截断句子。
+        """
+        if not text:
+            return []
+        if len(text) <= chunk_size:
+            return [text]
+
+        segments: list[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= chunk_size:
+                segments.append(remaining)
+                break
+
+            # 在 chunk_size 附近找一个换行符作为切割点
+            cut = remaining.rfind("\n", 0, chunk_size + 50)
+            if cut <= 0 or cut > chunk_size + 50:
+                # 找不到换行符，硬切
+                cut = chunk_size
+            segments.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip("\n")
+
+        return segments
 
     def _clean_task_text(self, text: str) -> str:
         """从任务文本中移除所有 @mention 前缀"""
