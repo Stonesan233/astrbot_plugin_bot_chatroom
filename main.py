@@ -38,13 +38,16 @@ from astrbot.core.star.filter.command import GreedyStr
 
 # ---------------------------------------------------------------------------
 # 将 cc-astrbot-agent 的 src 加入 import 路径
+# 搜索多个可能的目录名：开发时 cc-astrbot-agent / 部署时 astrbot_plugin_claude_code_custom
 # ---------------------------------------------------------------------------
 _PLUGIN_DIR = Path(__file__).resolve().parent
-_AGENT_PLUGIN_DIR = _PLUGIN_DIR.parent / "cc-astrbot-agent"
-_AGENT_SRC = _AGENT_PLUGIN_DIR / "src"
-for _p in [str(_AGENT_SRC), str(_AGENT_PLUGIN_DIR)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_CANDIDATE_NAMES = ["cc-astrbot-agent", "astrbot_plugin_claude_code_custom"]
+for _name in _CANDIDATE_NAMES:
+    _dir = _PLUGIN_DIR.parent / _name
+    _src = _dir / "src"
+    for _p in [str(_src), str(_dir)]:
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
 
 from cc_agent.agent import ClaudeCodeAgent  # noqa: E402
 
