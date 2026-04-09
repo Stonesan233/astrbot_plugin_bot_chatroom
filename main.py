@@ -9,7 +9,7 @@ AstrBot 插件：双人格聊天室协作 (astrbot_plugin_bot_chatroom)
 - /chatroom @露娜大人 <任务>   由露娜大人开始处理
 - /chatroom @朝日娘 <任务>     由朝日娘开始处理
 - /chatroom <任务>             智能路由到合适的人格
-- /chatroom status             查看当前协作状态
+- /chatroom status             查看协作状态（含全局活跃会话）
 - /chatroom history            查看对话历史
 - /chatroom reset              重置当前会话
 - /chatroom help               显示帮助
@@ -50,6 +50,9 @@ from cc_agent.agent import ClaudeCodeAgent  # noqa: E402
 
 PLUGIN_NAME = "astrbot_plugin_bot_chatroom"
 
+# 会话过期时间（秒），超过此时间的空闲会话自动清理
+_CONVERSATION_TTL = 3600  # 1 小时
+
 # ===========================================================================
 # 人格定义
 # ===========================================================================
@@ -86,27 +89,22 @@ PERSONAS: dict[str, dict] = {
     },
 }
 
-# 检测输出中委托标记的正则 —— 匹配最后一个 @name 任务
+# 检测输出中委托标记的正则 —— 匹配 @name 后面跟随的任务描述
 _DELEGATE_RE = re.compile(
-    r"(?m)@(?P<name>露娜大人|朝日娘|[Ll]una|[Aa]sahi)"
+    r"(?im)@(?P<name>露娜大人|朝日娘|[Ll]una|[Aa]sahi)"
     r"\s*[，,：:：]?\s*(?P<msg>.+?)$"
 )
 
-# 映射：别名 → persona_id  （@前缀已去掉）
+# 扁平映射：别名（去 @，小写） → persona_id
 _ALIAS_MAP: dict[str, str] = {}
 for _pid, _pinfo in PERSONAS.items():
     for _n in _pinfo["names"]:
         _ALIAS_MAP[_n.lstrip("@").lower()] = _pid
 
 
-# ===========================================================================
-# 辅助：名称 → persona_id
-# ===========================================================================
-
 def _resolve_persona_id(raw_name: str) -> Optional[str]:
-    """将任意别名（含/不含 @）解析为 persona_id。"""
-    key = raw_name.lstrip("@").lower().strip()
-    return _ALIAS_MAP.get(key)
+    """将任意别名（含/不含 @）解析为 persona_id"""
+    return _ALIAS_MAP.get(raw_name.lstrip("@").lower().strip())
 
 
 # ===========================================================================
@@ -125,15 +123,7 @@ class BotChatroomPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._agent: Optional[ClaudeCodeAgent] = None
-        # 对话状态管理: key = conversation_id
-        # value = {
-        #   "turns":            list[dict],
-        #   "initial_persona":  str,
-        #   "status":           str  (idle / active / completed / timeout / error),
-        #   "max_rounds":       int,
-        #   "created_at":       float,
-        #   "updated_at":       float,
-        # }
+        # 对话状态: key = conversation_id
         self.conversations: dict[str, dict] = {}
 
     # ===================================================================
@@ -186,7 +176,7 @@ class BotChatroomPlugin(Star):
         logger.info(f"[{PLUGIN_NAME}] 已卸载")
 
     # ===================================================================
-    # 命令入口  /chatroom
+    # 命令入口 /chatroom
     # ===================================================================
 
     @filter.command("chatroom")
@@ -197,7 +187,7 @@ class BotChatroomPlugin(Star):
         /chatroom 双人格聊天室命令
 
         子命令:
-          status   查看协作状态
+          status   查看协作状态（含全部活跃会话）
           help     显示帮助
           history  查看对话历史
           reset    重置当前会话
@@ -263,25 +253,22 @@ class BotChatroomPlugin(Star):
         判断消息应由哪个人格处理。
 
         优先级:
-          1. 消息中显式 @mention（@露娜大人 / @luna / @朝日娘 / @asahi）
+          1. 消息中显式 @mention（大小写不敏感）
           2. 从 event 上下文获取当前会话的 persona_id
           3. 默认 "luna"
         """
-        # 1) 显式 @mention
         mentioned = self._detect_persona_from_text(text)
         if mentioned:
             return mentioned
 
-        # 2) 从 event 上下文获取
         from_event = await self._get_persona_from_event(event)
         if from_event:
             return from_event
 
-        # 3) 默认
         return "luna"
 
     def _detect_persona_from_text(self, text: str) -> Optional[str]:
-        """从文本 @mention 中检测目标人格（返回 persona_id 或 None）"""
+        """从文本 @mention 中检测目标人格（大小写不敏感）"""
         text_lower = text.lower()
         for pid, pinfo in PERSONAS.items():
             for name in pinfo["names"]:
@@ -296,11 +283,10 @@ class BotChatroomPlugin(Star):
         从 event 上下文中获取当前会话绑定的 persona_id。
 
         查找路径:
-          a) event.persona_id / event.persona 属性
-          b) event.session.persona_id
+          a) event.persona_id / event.persona
+          b) event.session.persona_id / event.session.persona
           c) conversation_manager → 当前会话 → persona_id
         """
-        # a) event 直接属性
         for attr in ("persona_id", "persona"):
             val = getattr(event, attr, None)
             if val and isinstance(val, str):
@@ -308,7 +294,6 @@ class BotChatroomPlugin(Star):
                 if pid:
                     return pid
 
-        # b) session 属性
         session = getattr(event, "session", None)
         if session:
             for attr in ("persona_id", "persona"):
@@ -318,7 +303,6 @@ class BotChatroomPlugin(Star):
                     if pid:
                         return pid
 
-        # c) conversation_manager 异步获取
         try:
             conv_mgr = getattr(self.context, "conversation_manager", None)
             if conv_mgr:
@@ -336,7 +320,7 @@ class BotChatroomPlugin(Star):
         return None
 
     # ===================================================================
-    # 核心：_internal_delegate  —  内部委托循环
+    # 核心：_internal_delegate — 内部委托循环
     # ===================================================================
 
     async def _internal_delegate(
@@ -351,15 +335,12 @@ class BotChatroomPlugin(Star):
 
         流程:
           1. 获取 / 创建对话状态 (self.conversations[conversation_id])
-          2. 构建 persona prompt + 协作历史
-          3. 调用 agent.run_task()
-          4. 记录本轮到对话历史
-          5. 检查回复中是否包含 @委托
-             - 有 → 递归委托给目标人格（轮次 +1）
-             - 无 → 协作结束，返回最终回复
-          6. 超过 max_rounds 自动截断
+          2. 每轮: 构建 persona prompt → 调用 agent.run_task() → 记录
+          3. 检测回复中 @委托 → 切换目标人格继续
+          4. 无委托或达到 max_rounds → 结束
 
-        返回: 最终回复文本
+        每轮 from_persona → to_persona → message 完整记录。
+        多轮对话上限由 max_internal_turns 控制（默认 8）。
         """
         conversation_id = self._get_conversation_id(event)
         conv = self._get_or_create_conversation(conversation_id)
@@ -372,27 +353,16 @@ class BotChatroomPlugin(Star):
         if not self._agent.api_key:
             return "API Key 未配置，请在插件设置中填写。"
 
-        # 初始化本轮协作
+        # 重置本轮协作（新任务清空旧 turns）
+        conv["turns"] = []
         conv["initial_persona"] = to_persona
         conv["status"] = "active"
-        conv["updated_at"] = time.monotonic()
-
-        # 记录发起委托
-        # （from_persona 可能是 "system" = 主人直接指定，
-        #   也可能是另一个人格在内部委托）
-        conv["turns"].append({
-            "from_persona": from_persona,
-            "to_persona": to_persona,
-            "message": message,
-            "response": "",       # 尚未回复，下面填充
-            "delegated_to": None,
-            "timestamp": time.time(),
-        })
+        conv["updated_at"] = time.time()
 
         start = time.monotonic()
+        delegator = from_persona
         current_persona = to_persona
         current_task = message
-        delegator = from_persona
 
         logger.info(
             f"[{PLUGIN_NAME}] _internal_delegate 开始 | "
@@ -402,48 +372,58 @@ class BotChatroomPlugin(Star):
         )
 
         try:
-            round_count = 0
-
-            while round_count < max_rounds:
-                round_count += 1
-                conv["updated_at"] = time.monotonic()
+            for round_num in range(1, max_rounds + 1):
+                conv["updated_at"] = time.time()
 
                 logger.info(
                     f"[{PLUGIN_NAME}] 内部轮次 "
-                    f"{round_count}/{max_rounds} | "
+                    f"{round_num}/{max_rounds} | "
                     f"人格={PERSONAS[current_persona]['label']} | "
                     f"任务={current_task[:60]}"
                 )
 
-                # 1) 构建 prompt
+                # 发送中间状态通知（长任务时让主人知道进展）
+                if round_num > 1:
+                    try:
+                        prev = conv["turns"][-1] if conv["turns"] else None
+                        if prev:
+                            prev_label = PERSONAS.get(
+                                prev["to_persona"], {}
+                            ).get("label", "?")
+                            await event.send(
+                                f"🔄 内部轮次 {round_num}: "
+                                f"{PERSONAS[current_persona]['label']} "
+                                f"正在接手任务"
+                                f"（来自 {prev_label} 的委托）..."
+                            )
+                    except Exception:
+                        pass  # 平台不支持多段发送则忽略
+
+                # 1) 构建 prompt（含角色设定 + 历史记录 + 当前任务）
                 prompt = self._build_persona_prompt(
                     current_persona, current_task, conv["turns"]
                 )
 
-                # 2) 调用 agent
+                # 2) 调用底层 agent.run_task()
                 response = await self._call_agent(prompt, current_persona)
 
-                # 3) 更新最后一轮的 response（首轮）
-                #    或追加新轮次（后续轮）
-                if round_count == 1:
-                    conv["turns"][-1]["response"] = response
-                else:
-                    conv["turns"].append({
-                        "from_persona": delegator,
-                        "to_persona": current_persona,
-                        "message": current_task,
-                        "response": response,
-                        "delegated_to": None,
-                        "timestamp": time.time(),
-                    })
+                # 3) 记录本轮到对话历史
+                turn = {
+                    "from_persona": delegator,
+                    "to_persona": current_persona,
+                    "message": current_task,
+                    "response": response,
+                    "delegated_to": None,
+                    "timestamp": time.time(),
+                }
+                conv["turns"].append(turn)
 
-                # 4) 检测是否有进一步委托
+                # 4) 检测回复中是否包含 @委托
                 delegation = self._detect_delegation_in_response(response)
 
                 if delegation:
                     target_persona, delegated_msg = delegation
-                    # 标记当前轮的委托目标
-                    conv["turns"][-1]["delegated_to"] = target_persona
+                    turn["delegated_to"] = target_persona
 
                     logger.info(
                         f"[{PLUGIN_NAME}] 委托: "
@@ -455,14 +435,13 @@ class BotChatroomPlugin(Star):
                     delegator = current_persona
                     current_persona = target_persona
                     current_task = delegated_msg
-                    continue
+                    # continue → 下一轮
                 else:
                     # 无更多委托 → 协作完成
                     conv["status"] = "completed"
                     break
-
             else:
-                # 达到最大轮次
+                # for 循环正常结束 → 达到最大轮次
                 conv["status"] = "timeout"
                 logger.warning(
                     f"[{PLUGIN_NAME}] 内部对话达到最大轮次 "
@@ -511,15 +490,16 @@ class BotChatroomPlugin(Star):
             f"耗时={elapsed:.1f}s"
         )
 
+        # 清理过期会话
+        self._cleanup_stale_conversations()
+
         return result
 
     # ===================================================================
     # Agent 调用
     # ===================================================================
 
-    async def _call_agent(
-        self, prompt: str, persona_id: str
-    ) -> str:
+    async def _call_agent(self, prompt: str, persona_id: str) -> str:
         """调用底层 ClaudeCodeAgent.run_task() 并收集完整输出"""
         if not self._agent:
             raise RuntimeError("Agent 未初始化")
@@ -558,8 +538,6 @@ class BotChatroomPlugin(Star):
         if history:
             parts.append("[之前的协作记录]")
             for turn in history:
-                if not turn.get("response"):
-                    continue  # 跳过尚未回复的空轮
                 from_label = PERSONAS.get(
                     turn["from_persona"], {}
                 ).get("label", turn["from_persona"])
@@ -610,9 +588,8 @@ class BotChatroomPlugin(Star):
     ) -> Optional[tuple[str, str]]:
         """
         从 Agent 回复中检测 @委托指令。
-
         返回 (target_persona_id, delegated_message) 或 None。
-        取最后一条委托（通常是最终意图）。
+        取最后一条委托作为最终意图。
         """
         matches = list(_DELEGATE_RE.finditer(text))
         if not matches:
@@ -661,8 +638,6 @@ class BotChatroomPlugin(Star):
         ]
 
         for i, turn in enumerate(turns, 1):
-            if not turn.get("response"):
-                continue
             label = PERSONAS.get(turn["to_persona"], {}).get("label", "?")
             parts.append(f"第{i}轮 - {label}:")
             parts.append(f"  任务: {turn['message'][:300]}")
@@ -685,7 +660,7 @@ class BotChatroomPlugin(Star):
         return raw_final
 
     # ===================================================================
-    # 智能路由入口 (_handle_chat)
+    # 智能路由入口
     # ===================================================================
 
     async def _handle_chat(
@@ -695,10 +670,7 @@ class BotChatroomPlugin(Star):
         解析消息中的 @mention，确定目标人格，
         然后调用 _internal_delegate 启动内部协作循环。
         """
-        # 1) 确定目标人格（优先 @mention > event 上下文 > 默认）
         target_persona = await self._detect_target_persona(text, event)
-
-        # 2) 清理任务文本（移除 @mention 前缀）
         task = self._clean_task_text(text)
 
         if not task:
@@ -713,7 +685,6 @@ class BotChatroomPlugin(Star):
             f"任务={task[:80]}"
         )
 
-        # 3) 调用 _internal_delegate
         return await self._internal_delegate(
             from_persona="system",
             to_persona=target_persona,
@@ -734,6 +705,7 @@ class BotChatroomPlugin(Star):
         """获取或创建对话状态"""
         if conversation_id not in self.conversations:
             self.conversations[conversation_id] = {
+                "id": conversation_id,
                 "turns": [],
                 "initial_persona": None,
                 "status": "idle",
@@ -749,6 +721,22 @@ class BotChatroomPlugin(Star):
             for name in pinfo["names"]:
                 text = re.sub(re.escape(name), "", text, flags=re.IGNORECASE)
         return text.strip()
+
+    def _cleanup_stale_conversations(self):
+        """清理超过 TTL 的空闲会话，防止内存持续增长"""
+        now = time.time()
+        stale = [
+            cid
+            for cid, conv in self.conversations.items()
+            if conv["status"] != "active"
+            and (now - conv["updated_at"]) > _CONVERSATION_TTL
+        ]
+        for cid in stale:
+            del self.conversations[cid]
+        if stale:
+            logger.debug(
+                f"[{PLUGIN_NAME}] 清理 {len(stale)} 个过期会话"
+            )
 
     # ===================================================================
     # 输出格式化
@@ -773,7 +761,6 @@ class BotChatroomPlugin(Star):
             chain = " → ".join(
                 PERSONAS.get(t["to_persona"], {}).get("emoji", "?")
                 for t in turns
-                if t.get("response")
             )
             parts.append(
                 f"{initial_emoji} 协作完成 | "
@@ -793,8 +780,6 @@ class BotChatroomPlugin(Star):
             parts.append("")
             parts.append("── 协作过程 ──")
             for i, turn in enumerate(turns, 1):
-                if not turn.get("response"):
-                    continue
                 emoji = PERSONAS.get(
                     turn["to_persona"], {}
                 ).get("emoji", "💬")
@@ -869,8 +854,6 @@ class BotChatroomPlugin(Star):
         ]
 
         for i, turn in enumerate(conv["turns"], 1):
-            if not turn.get("response"):
-                continue
             emoji = PERSONAS.get(
                 turn["to_persona"], {}
             ).get("emoji", "💬")
@@ -891,18 +874,23 @@ class BotChatroomPlugin(Star):
         return "\n".join(lines)
 
     def _status_text(self, event: AstrMessageEvent) -> str:
-        """协作状态报告"""
+        """协作状态报告：全局 + 当前会话"""
         cid = self._get_conversation_id(event)
         conv = self.conversations.get(cid)
 
         agent_ok = self._agent is not None
         api_ok = self._agent is not None and bool(self._agent.api_key)
         model = self._agent.model if self._agent else "未知"
+
+        # 统计全部会话
         active_count = sum(
             1 for c in self.conversations.values()
             if c["status"] == "active"
         )
         total_count = len(self.conversations)
+        total_turns = sum(
+            len(c["turns"]) for c in self.conversations.values()
+        )
 
         lines: list[str] = [
             "🌙🌅 双人格聊天室状态",
@@ -911,11 +899,31 @@ class BotChatroomPlugin(Star):
             f"  API Key:   {'✅ 已配置' if api_ok else '❌ 未配置'}",
             f"  模型:      {model}",
             f"  会话数:    {active_count} 活跃 / {total_count} 总计",
+            f"  总轮次:    {total_turns}",
             f"  最大轮次:  {self.config.get('max_internal_turns', 8)}",
             f"  自动审阅:  "
             f"{'✅ 开启' if self.config.get('auto_review', False) else '关闭'}",
         ]
 
+        # ---- 全局活跃会话列表 ----
+        active_convs = [
+            (c_id, c) for c_id, c in self.conversations.items()
+            if c["status"] == "active"
+        ]
+        if active_convs:
+            lines.extend(["", "── 全局活跃会话 ──"])
+            for c_id, c in active_convs:
+                initial = PERSONAS.get(
+                    c.get("initial_persona", ""), {}
+                ).get("label", "?")
+                n_turns = len(c["turns"])
+                lines.append(
+                    f"  🔄 {initial} | "
+                    f"{n_turns}/{c['max_rounds']} 轮 | "
+                    f"id={c_id[:24]}..."
+                )
+
+        # ---- 当前会话详情 ----
         if conv:
             initial = (
                 PERSONAS.get(conv["initial_persona"], {}).get("label", "无")
@@ -943,7 +951,6 @@ class BotChatroomPlugin(Star):
                     f"{PERSONAS.get(t['to_persona'], {}).get('emoji', '?')}"
                     f"{PERSONAS.get(t['to_persona'], {}).get('label', '?')}"
                     for t in conv["turns"]
-                    if t.get("response")
                 )
                 lines.append(f"  链路:      {chain}")
 
@@ -968,10 +975,10 @@ class BotChatroomPlugin(Star):
             "  形成内部多轮对话，最终汇总结果呈现给您。\n"
             "  内部对话最多 8 轮（可配置），避免死循环。\n"
             "\n"
-            "智能路由:\n"
-            "  如果消息中包含 @露娜大人/@luna，由露娜处理；\n"
-            "  如果包含 @朝日娘/@asahi，由朝日娘处理；\n"
-            "  否则根据当前会话绑定的 persona 自动决定。\n"
+            "智能路由（大小写不敏感）:\n"
+            "  @露娜大人 / @luna  → 露娜大人处理\n"
+            "  @朝日娘   / @asahi → 朝日娘处理\n"
+            "  无 @                → 根据会话 persona 自动决定\n"
             "\n"
             "示例:\n"
             "  /chatroom @露娜大人 设计一个 RESTful API\n"
