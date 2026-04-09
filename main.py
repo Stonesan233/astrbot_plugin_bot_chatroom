@@ -60,7 +60,7 @@ _CONVERSATION_TTL = 3600  # 1 小时
 PERSONAS: dict[str, dict] = {
     "luna": {
         "id": "luna",
-        "names": ["@露娜大人", "@luna", "@Luna", "@LUNA"],
+        "names": ["@露娜大人", "@露娜", "@luna", "@Luna", "@LUNA"],
         "label": "露娜大人",
         "emoji": "🌙",
         "role_desc": (
@@ -74,7 +74,7 @@ PERSONAS: dict[str, dict] = {
     },
     "asahi": {
         "id": "asahi",
-        "names": ["@朝日娘", "@asahi", "@Asahi", "@ASAHI"],
+        "names": ["@朝日娘", "@朝日", "@asahi", "@Asahi", "@ASAHI"],
         "label": "朝日娘",
         "emoji": "🌅",
         "role_desc": (
@@ -91,7 +91,7 @@ PERSONAS: dict[str, dict] = {
 
 # 检测输出中委托标记的正则 —— 匹配 @name 后面跟随的任务描述
 _DELEGATE_RE = re.compile(
-    r"(?im)@(?P<name>露娜大人|朝日娘|[Ll]una|[Aa]sahi)"
+    r"(?im)@(?P<name>露娜大人|露娜|朝日娘|朝日|[Ll]una|[Aa]sahi)"
     r"\s*[，,：:：]?\s*(?P<msg>.+?)$"
 )
 
@@ -162,7 +162,8 @@ class BotChatroomPlugin(Star):
                 base_url=base_url,
             )
             logger.info(
-                f"[{PLUGIN_NAME}] 初始化完成 | "
+                f"[{PLUGIN_NAME}] 双人格聊天室插件已加载，"
+                f"支持 @露娜大人 和 @朝日娘 进行内部协作 | "
                 f"model={model} | root={project_root}"
             )
         except Exception as e:
@@ -391,7 +392,7 @@ class BotChatroomPlugin(Star):
                                 prev["to_persona"], {}
                             ).get("label", "?")
                             await event.send(
-                                f"🔄 内部轮次 {round_num}: "
+                                f"🔄 内部轮次 {round_num}/{max_rounds}: "
                                 f"{PERSONAS[current_persona]['label']} "
                                 f"正在接手任务"
                                 f"（来自 {prev_label} 的委托）..."
@@ -404,8 +405,21 @@ class BotChatroomPlugin(Star):
                     current_persona, current_task, conv["turns"]
                 )
 
-                # 2) 调用底层 agent.run_task()
+                # 2) 调用底层 agent.run_task(task=prompt, persona=to_persona)
                 response = await self._call_agent(prompt, current_persona)
+
+                # 3) 每轮结果实时发给主人
+                try:
+                    emoji = PERSONAS[current_persona]["emoji"]
+                    label = PERSONAS[current_persona]["label"]
+                    preview = response[:300]
+                    if len(response) > 300:
+                        preview += "..."
+                    await event.send(
+                        f"{emoji} [{label}] 第{round_num}轮回复:\n{preview}"
+                    )
+                except Exception:
+                    pass
 
                 # 3) 记录本轮到对话历史
                 turn = {
@@ -976,9 +990,9 @@ class BotChatroomPlugin(Star):
             "  内部对话最多 8 轮（可配置），避免死循环。\n"
             "\n"
             "智能路由（大小写不敏感）:\n"
-            "  @露娜大人 / @luna  → 露娜大人处理\n"
-            "  @朝日娘   / @asahi → 朝日娘处理\n"
-            "  无 @                → 根据会话 persona 自动决定\n"
+            "  @露娜大人 / @露娜 / @luna  → 露娜大人处理\n"
+            "  @朝日娘   / @朝日 / @asahi → 朝日娘处理\n"
+            "  无 @                        → 根据会话 persona 自动决定\n"
             "\n"
             "示例:\n"
             "  /chatroom @露娜大人 设计一个 RESTful API\n"
